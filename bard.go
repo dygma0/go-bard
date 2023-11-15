@@ -82,6 +82,7 @@ func (b *Bard) Init() {
 	b.client = &http.Client{}
 	b.conversationId = ""
 	b.responseId = ""
+	b.choiceId = ""
 	b.setUpToken()
 }
 
@@ -94,33 +95,42 @@ func (b *Bard) setUpToken() {
 }
 
 func (b *Bard) Ask(prompt string) (Answer, error) {
-	encodedPrompt := strings.ReplaceAll(strings.ReplaceAll(prompt, "\n", "\\\\n"), "\"", "\\\\\\\"")
-	body, query := b.createAskRequest(encodedPrompt)
-	plainAnswer, err := b.getAnswer(query, body)
+	body, query := b.createAskRequest(prompt)
+	answer, err := b.requestAnswer(query, body)
 	if err != nil {
 		return Answer{}, err
 	}
-
-	answer, err := b.parseAnswer(plainAnswer)
-	if err != nil {
-		return Answer{}, err
-	}
-
-	b.updateChainOfThougths(answer)
-
 	return answer, nil
 }
 
-func (b *Bard) updateChainOfThougths(answer Answer) {
-	b.conversationId = answer.ConversationId
-	b.responseId = answer.ResponseId
-	b.choiceId = answer.ChoiceId
-}
-
 func (b *Bard) createAskRequest(prompt string) (map[string]string, map[string]string) {
-	payload := fmt.Sprintf("[null,\"[[\\\"%s\\\",0,null,[],null,null,0],[\\\"ko\\\"],[\\\"%s\\\",\\\"%s\\\",\\\"%s\\\",null,null,[]],null,null,null,[0],0,[],[],1,0]\"]", prompt, b.conversationId, b.responseId, b.choiceId)
+	sess := []interface{}{
+		[]interface{}{prompt, 0, nil, []interface{}{}, nil, nil, 0},
+		[]interface{}{"ko"},
+		[]interface{}{b.conversationId, b.responseId, b.choiceId, nil, nil, []interface{}{}},
+		nil,
+		nil,
+		nil,
+		[]interface{}{0},
+		0,
+		[]interface{}{},
+		[]interface{}{},
+		1,
+		0,
+	}
+	message, err := json.Marshal(sess)
+	if err != nil {
+		return nil, nil
+	}
+
+	p := []interface{}{nil, string(message)}
+	payload, err := json.Marshal(p)
+	if err != nil {
+		panic(err)
+	}
+
 	body := map[string]string{
-		"f.req": payload,
+		"f.req": string(payload),
 		"at":    b.snlm0e,
 	}
 
@@ -133,21 +143,32 @@ func (b *Bard) createAskRequest(prompt string) (map[string]string, map[string]st
 	return body, query
 }
 
-func (b *Bard) getAnswer(query map[string]string, body map[string]string) (string, error) {
+var errNoAnswer = errors.New("failed to get response")
+
+func IsNoAnswer(err error) bool {
+	return errors.Is(err, errNoAnswer)
+}
+
+func (b *Bard) requestAnswer(query map[string]string, body map[string]string) (Answer, error) {
 	content, err := b.PostFormData("https://bard.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate", query, body)
 	if err != nil {
-		return "", err
+		return Answer{}, err
 	}
 
 	lines := strings.Split(content, "\n")
 	if len(lines) < 4 || lines[3] == "" {
-		return "", errors.New("failed to get response")
+		return Answer{}, errNoAnswer
 	}
 
-	return lines[3], nil
+	answer, err := b.makeAnswer(lines[3])
+	if err != nil {
+		return Answer{}, errNoAnswer
+	}
+
+	return answer, nil
 }
 
-func (b *Bard) parseAnswer(reponse string) (Answer, error) {
+func (b *Bard) makeAnswer(reponse string) (Answer, error) {
 	var root [][]interface{}
 	if err := json.Unmarshal([]byte(reponse), &root); err != nil {
 		return Answer{}, err
@@ -187,13 +208,32 @@ func (b *Bard) parseAnswer(reponse string) (Answer, error) {
 	}
 
 	answer := answerElements[1].([]interface{})
+	conversationId := id[0].(string)
+	responseId := id[1].(string)
+	choiceId := answerElements[0].(string)
+
+	b.conversationId = conversationId
+	b.responseId = responseId
+	b.choiceId = choiceId
 
 	return Answer{
-		ConversationId: id[0].(string),
-		ResponseId:     id[1].(string),
-		ChoiceId:       answerElements[0].(string),
+		ConversationId: conversationId,
+		ResponseId:     responseId,
+		ChoiceId:       choiceId,
 		Content:        answer[0].(string),
 	}, nil
+}
+
+type snim0eFailureError struct{}
+
+func (e snim0eFailureError) Error() string {
+	return "failed to get snim0e"
+}
+
+func IsSnim0eFailure(err error) bool {
+	var snim0eFailureError snim0eFailureError
+	ok := errors.As(err, &snim0eFailureError)
+	return ok
 }
 
 func (b *Bard) getSnim0e() (string, error) {
@@ -205,7 +245,7 @@ func (b *Bard) getSnim0e() (string, error) {
 	re := regexp.MustCompile(`SNlM0e":"(.*?)"`)
 	matches := re.FindStringSubmatch(resp)
 	if len(matches) < 2 {
-		return "", errors.New("failed to get SNIM0E")
+		return "", snim0eFailureError{}
 	}
 
 	return matches[1], nil
@@ -247,6 +287,22 @@ func (b *Bard) createDefaultCookie() []http.Cookie {
 	}
 }
 
+type fetchError struct {
+	StatusCode int
+	url        string
+	method     string
+}
+
+func (e fetchError) Error() string {
+	return fmt.Sprintf("failed to fetch %s %s", e.method, e.url)
+}
+
+func IsFetchError(err error) bool {
+	var fetchError fetchError
+	ok := errors.As(err, &fetchError)
+	return ok
+}
+
 func (b *Bard) fetch(method string, url string, hds http.Header, c []http.Cookie, queryParams map[string]string, body io.Reader) (string, error) {
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
@@ -270,10 +326,19 @@ func (b *Bard) fetch(method string, url string, hds http.Header, c []http.Cookie
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+
+		}
+	}(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return "", errors.New("failed to fetch")
+		return "", fetchError{
+			StatusCode: resp.StatusCode,
+			url:        url,
+			method:     method,
+		}
 	}
 
 	bytes, err := io.ReadAll(resp.Body)
